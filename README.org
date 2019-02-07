@@ -1,0 +1,3 @@
+* Android integration tools for Emacs.
+
+Provide a bit of gradle integration (compile, run, run current activity) and log symbolications for NDK.
