@@ -1,4 +1,4 @@
-;;; android.el --- Android helpers.
+;;; android.el --- Android helpers. -*- lexical-binding: t; -*-
 
 ;; Author: Damien Merenne
 ;; URL: https://github.com/canatella/android-el
@@ -32,6 +32,7 @@
 ;;; Code:
 (require 'subr-x)
 (require 'seq)
+(require 'pbuf)
 
 (defcustom android-sdk-home "~/android-sdk"
   "Path to the Android SDK installation."
@@ -43,12 +44,12 @@
   :group 'android
   :type 'directory)
 
-(defcustom android-ndk-platform "android-21"
+(defcustom android-ndk-platform "android-29"
   "The android NDK platform for this project."
   :group 'android
   :type 'string)
 
-(defcustom android-ndk-abi "armeabi-v7a"
+(defcustom android-ndk-abi "arm64-v8a"
   "The android NDK platform for this project."
   :group 'android
   :type '(radio
@@ -57,6 +58,11 @@
           (const :tag "arm64-v8a")
           (const :tag "x86")
           (const :tag "x86-64")))
+
+(defcustom android-adb-path "adb"
+  "The adb executable path."
+  :group 'android
+  :type 'string)
 
 (defvar android-project-history nil "History list of activities.")
 
@@ -94,11 +100,11 @@
 
 (defun android-ndk-include-path (&optional abi platform)
   "Fetch NDK headers path for application ABI and PLATFORM."
-  (concat (android-ndk-var "SYSROOT_INC" abi) "/usr/include"))
+  (file-name-as-directory (replace-regexp-in-string "-isystem " "" (android-ndk-var "SYSROOT_ARCH_INC_ARG" abi))))
 
 (defun android-ndk-library-path (&optional abi platform)
   "Fetch library path of Android NDK for application ABI and PLATFORM."
-  (concat (android-ndk-var "SYSROOT_INC" abi) "/usr/lib"))
+  (file-name-as-directory (android-ndk-var "SYSROOT_API_LIB_DIR" abi)))
 
 (defun android-project (&optional buffer)
   "Return the root of an Android project for BUFFER."
@@ -199,12 +205,6 @@ Returns nil if the buffer is not a java buffer or does not define an activity."
     (if (string-empty-p tag) tags
       (android-read-tags (cons tag tags)))))
 
-(defun android-logcat-filter-carriage-returns (pos)
-  "Process filter to remove carriage return up to POS."
-  (save-excursion
-    (while (search-backward "\r" pos t)
-      (delete-char 1))))
-
 (defvar android-ndk-addr2line-search-path (list (android-ndk-library-path)))
 
 (defvar android-ndk-addr2line-path (android-ndk-which "addr2line")
@@ -212,72 +212,54 @@ Returns nil if the buffer is not a java buffer or does not define an activity."
 
 (defun android-ndk-addr2line-find-binary-default (path list)
   "Match PATH in LIST based on file base name."
-  (message "finding %s in %s" path list)
-  (let ((binaries (seq-map (lambda (p)
-                             (format "%s%s"
-                                     (file-name-as-directory p)
-                                     (file-name-nondirectory path)))
-                           list)))
-    (seq-find 'file-readable-p binaries)))
+  (when list
+    (let ((file (concat (car list) (file-name-nondirectory path))))
+      (if (file-readable-p file)
+          file
+        (android-ndk-addr2line-find-binary-default path (cdr list))))))
+
 
 (defvar android-ndk-addr2line-find-binary
   'android-ndk-addr2line-find-binary-default)
 
+(defvar android-ndk-cache (make-hash-table :test #'equal))
+
+(defun android-ndk-addr2line-find-binary (binary)
+  "Find BINARY in PATH.
+
+See `android-ndk-addr2line-find-binary."
+  (gethash binary android-ndk-cache
+           (let ((result (funcall android-ndk-addr2line-find-binary
+                                  binary android-ndk-addr2line-search-path)))
+             (puthash binary result  android-ndk-cache)
+             result)))
+
 (defun android-ndk-addr2line (file address)
   "Run addr2line to fetch source file and line for FILE and ADDRESS."
-  (let* ((binary (funcall android-ndk-addr2line-find-binary
-                          file android-ndk-addr2line-search-path))
-         (command (format "%s -e %s %s"
-                          android-ndk-addr2line-path
-                          binary address))
-         (result (split-string (shell-command-to-string command) ":")))
-    (unless (string= (car result) "??")
-      (cons (file-truename (car result)) (cadr result)))))
+  (let ((binary (android-ndk-addr2line-find-binary file)))
+    (when binary
+      (let* ((command (format "%s -e %s %s"
+                              android-ndk-addr2line-path
+                              binary address))
+             (result (split-string (substring (shell-command-to-string command) 0 -1) ":")))
+        (unless (string= (car result) "??")
+          (format "%s:%s" (file-truename (car result)) (cadr result)))))))
 
-(defun android-logcat-filter-addr2line (pos)
-  "Process filter to replace stack traces with addr2line output up to POS."
-  (save-excursion
-    (goto-char pos)
-    (beginning-of-line)
-    (while (re-search-forward
-            "#[0-9]\+ +pc +\\([0-9a-f]+\\) +\\([^[:space:]]+\\)" nil t)
-      (let* ((data (match-data))
-             (address (match-string 1))
-             (file (match-string 2))
-             (dest (android-ndk-addr2line file address)))
-        (when dest
-          (let ((replacement (format "%s:%s" (car dest) (cdr dest))))
-            (set-match-data data)
-            (add-text-properties 0 (length (car dest))
-                                 '(face font-lock-warning-face) replacement)
-            (add-text-properties (+ (length (car dest)) 1)
-                                 (-(length replacement) 1)
-                                 '(face font-lock-warning-face) replacement)
-            (replace-match replacement t t)
-            ))))))
-
-(defun android-logcat-filter (proc string)
-  "Symbolize stacktraces in PROC output STRING with addr2line."
-  (when (buffer-live-p (process-buffer proc))
-    (with-current-buffer (process-buffer proc)
-      (let ((inhibit-read-only t)
-            (moving (= (point) (process-mark proc)))
-            (last (process-mark proc))
-            (android-ndk-addr2line-path (android-ndk-which "addr2line")))
-        (save-excursion
-          (goto-char last)
-          (insert string)
-          (android-logcat-filter-carriage-returns last)
-          (android-logcat-filter-addr2line last)
-          (set-marker (process-mark proc) (point)))
-        (if moving (goto-char (process-mark proc)))))))
+(defun android-logcat-filter-addr2line (line)
+  "Replace stack traces in LINE with addr2line output."
+  (when (string-match "\\(.*\\)#[0-9]+ +pc +\\([0-9a-f]+\\) +[^![:space:]]+!?\\([^[:space:]]+\\)\\(.*\\)" line)
+    (let ((before (match-string 1 line))
+          (address (match-string 2 line))
+          (file (match-string 3 line))
+          (after (match-string 4 line)))
+      (setq line (concat before (android-ndk-addr2line file address) after))))
+  line)
 
 (defun android-addr2line (&optional buffer)
   "Try to resolve stack trace in BUFFER using addr2line."
   (interactive "bBuffer: \n")
   (save-excursion
     (with-current-buffer (or buffer (current-buffer))
-      (message "ADDR2LINE is %s" android-ndk-addr2line-path)
       (goto-char (point-min))
       (android-logcat-filter-addr2line (point))
       (while (not (zerop (forward-line)))
@@ -285,12 +267,23 @@ Returns nil if the buffer is not a java buffer or does not define an activity."
 
 (defvar android-logcat-tags '())
 (defvar android-logcat-process nil)
+(defvar android-logcat-line-count 0)
 
 (defun android-logcat-tag-filter-option (tags)
   "Return adb logcat -s option to display only TAGS."
   (if tags
       (concat " -s " (string-join (append android-mandatory-tags tags) " "))
     ""))
+
+(defun android-logcat-start-process (tags name buffer)
+  "Return a logcat process with NAME and output in BUFFER filtered with TAGS."
+  (make-local-variable 'android-ndk-addr2line-find-binary)
+  (make-local-variable 'android-ndk-addr2line-search-path)
+  (setq-local android-ndk-addr2line-path (android-ndk-which "addr2line"))
+  (let* ((default-directory (or (android-project) default-directory))
+         (options (android-logcat-tag-filter-option tags))
+         (command (format "%s logcat -v threadtime -T %s %s" android-adb-path pbuf-max-line-count options)))
+    (start-process-shell-command "adb-logcat" "*adb-logcat*" command)))
 
 ;;;###autoload
 (defun android-logcat (&optional tags)
@@ -302,31 +295,9 @@ If FILTER is given, append it to the logcat command line."
            (when (or (not android-logcat-tags) read-tags)
              (setq android-logcat-tags (android-read-tags android-default-tags))
              android-logcat-tags))))
-  (with-current-buffer (get-buffer-create "*adb-logcat*")
-    (if (process-live-p android-logcat-process)
-        (kill-process android-logcat-process))
-    (read-only-mode)
-    (let ((inhibit-read-only t))
-      (delete-region (point-min) (point-max)))
-    (goto-char (point-max))
-    (let* ((default-directory (or (android-project) default-directory))
-           (options (android-logcat-tag-filter-option tags))
-           (command (concat "adb logcat -v threadtime" options))
-           (process (start-process-shell-command
-                     "adb-logcat" "*adb-logcat*" command)))
-      (set-process-filter process 'android-logcat-filter)
-      (message "running %s" command)
-      (setq-local android-logcat-process process))))
-
-(defun android-logcat-clean ()
-  "Reset the logcat buffer."
-  (when (get-buffer "*adb-logcat*")
-    (with-current-buffer "*adb-logcat*"
-      (let ((inhibit-read-only t))
-        (delete-region (point-min) (point-max))
-        (goto-char (point-max))
-        (if (process-live-p android-logcat-process)
-            (set-marker (process-mark android-logcat-process) (point)))))))
+  (let ((pbuf-pre-insert-functions (list #'android-logcat-filter-addr2line)))
+    (pbuf-start-process "*adb-logcat*"
+                        (apply-partially #'android-logcat-start-process tags))))
 
 ;;;###autoload
 (defun android-send-clipboard ()
